@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "userProfile": {
+      "title": "User Profile",
+      "description": "Public profile for a user",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "globalRole": { "type": "string", "enum": ["superadmin", "user"] },
+        "createdAt": { "type": "timestamp" }
+      },
+      "required": ["email", "globalRole", "createdAt"]
+    },
+    "account": {
+      "title": "Social Account",
+      "description": "An agency account that users can post to",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "createdAt": { "type": "timestamp" },
+        "ownerId": { "type": "string" }
+      },
+      "required": ["name", "createdAt", "ownerId"]
+    },
+    "accountMember": {
+      "title": "Account Member",
+      "description": "A user's membership and role in an account",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["admin", "moderator"] },
+        "addedAt": { "type": "timestamp" },
+        "addedBy": { "type": "string" }
+      },
+      "required": ["role", "addedAt", "addedBy"]
+    },
+    "captionPost": {
+      "title": "Caption Post",
+      "description": "A post drafted for an account",
+      "type": "object",
+      "properties": {
+        "pillar": { "type": "string" },
+        "topic": { "type": "string" },
+        "content": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "approved", "published"] },
+        "authorId": { "type": "string" },
+        "scheduledDate": { "type": "timestamp", "description": "When the post is planned to be published" },
+        "hasGeneratedImage": { "type": "boolean" },
+        "mockImageUrl": { "type": "string" },
+        "createdAt": { "type": "timestamp" },
+        "updatedAt": { "type": "timestamp" }
+      },
+      "required": ["pillar", "topic", "content", "status", "authorId", "createdAt", "updatedAt"]
+    },
+    "ugcSubmission": {
+      "title": "UGC Submission",
+      "description": "A user-generated content submission",
+      "type": "object",
+      "properties": {
+        "clientName": { "type": "string" },
+        "clientProfileUrl": { "type": "string" },
+        "quote": { "type": "string" },
+        "photoUrl": { "type": "string" },
+        "uploadedBy": { "type": "string" },
+        "createdAt": { "type": "timestamp" }
+      },
+      "required": ["clientName", "quote", "photoUrl", "uploadedBy", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/userProfile" },
+      "description": "User profiles"
+    },
+    "/accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/account" },
+      "description": "Social accounts managed by the agency"
+    },
+    "/accounts/{accountId}/members/{userId}": {
+      "schema": { "$ref": "#/entities/accountMember" },
+      "description": "Members of a social account (admins and moderators)"
+    },
+    "/accounts/{accountId}/posts/{postId}": {
+      "schema": { "$ref": "#/entities/captionPost" },
+      "description": "Posts created under an account"
+    },
+    "/accounts/{accountId}/ugcSubmissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/ugcSubmission" },
+      "description": "UGC submissions for an account"
+    }
+  }
+}

@@ -1,0 +1,251 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- PRIMITIVE DEFINITIONS ---
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) 
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.globalRole == 'superadmin';
+    }
+
+    function isAccountAdmin(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isAccountModerator(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'moderator';
+    }
+
+    function isAccountContentCreator(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'content creator';
+    }
+
+    function isAccountAnalyst(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'analyst';
+    }
+    
+    function isAccountMember(accountId) {
+      return isAccountAdmin(accountId) || isAccountModerator(accountId) || isAccountContentCreator(accountId) || isAccountAnalyst(accountId);
+    }
+
+    // --- VALIDATION HELPER ---
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['email', 'globalRole', 'createdAt']) &&
+        data.email is string && data.email.size() <= 200 &&
+        data.globalRole in ['superadmin', 'user'] &&
+        (data.get('displayName', '') is string) &&
+        data.createdAt == request.time;
+    }
+    
+    function isValidUserProfileUpdate(data) {
+      return data.keys().hasAll(['email', 'globalRole', 'createdAt']) &&
+             data.email is string && data.email.size() <= 200 &&
+             data.globalRole in ['superadmin', 'user'] &&
+             (data.get('displayName', '') is string);
+    }
+
+    function isValidAccount(data) {
+      return data.keys().hasAll(['name', 'createdAt', 'ownerId']) &&
+             data.keys().size() == 3 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.ownerId == request.auth.uid &&
+             data.createdAt == request.time;
+    }
+
+    function isValidAccountMember(data) {
+      return data.keys().hasAll(['role', 'addedAt', 'addedBy', 'accountId', 'userId']) &&
+             data.keys().size() == 5 &&
+             data.role in ['admin', 'moderator', 'content creator', 'analyst'] &&
+             data.accountId is string && data.accountId.size() <= 128 &&
+             data.userId is string && data.userId.size() <= 128 &&
+             data.addedBy == request.auth.uid &&
+             data.addedAt == request.time;
+    }
+
+    function isValidPostCreate(data) {
+      return data.keys().hasAll(['pillar', 'topic', 'content', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+             data.keys().size() >= 7 && data.keys().size() <= 10 &&
+             data.pillar is string && data.pillar.size() <= 200 &&
+             data.topic is string && data.topic.size() <= 500 &&
+             data.content is string && data.content.size() <= 10000 &&
+             data.status in ['draft', 'approved', 'published'] &&
+             (data.get('scheduledDate', null) == null || data.scheduledDate is timestamp) &&
+             (data.get('hasGeneratedImage', false) is bool) &&
+             (data.get('mockImageUrl', null) == null || data.mockImageUrl is string) &&
+             data.authorId == request.auth.uid &&
+             data.createdAt == request.time &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidPostUpdate(data) {
+      return data.keys().hasAll(['pillar', 'topic', 'content', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+             data.keys().size() >= 7 && data.keys().size() <= 10 &&
+             data.pillar is string && data.pillar.size() <= 200 &&
+             data.topic is string && data.topic.size() <= 500 &&
+             data.content is string && data.content.size() <= 10000 &&
+             data.status in ['draft', 'approved', 'published'] &&
+             (data.get('scheduledDate', null) == null || data.scheduledDate is timestamp) &&
+             (data.get('hasGeneratedImage', false) is bool) &&
+             (data.get('mockImageUrl', null) == null || data.mockImageUrl is string) &&
+             data.authorId == existing().authorId &&
+             data.createdAt == existing().createdAt &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidUgcSubmission(data) {
+      return data.keys().hasAll(['clientName', 'quote', 'photoUrl', 'uploadedBy', 'createdAt']) &&
+             data.keys().size() >= 5 && data.keys().size() <= 6 &&
+             data.clientName is string && data.clientName.size() <= 200 &&
+             data.quote is string && data.quote.size() <= 5000 &&
+             data.photoUrl is string && data.photoUrl.size() <= 1000 &&
+             data.uploadedBy is string && data.uploadedBy == request.auth.uid &&
+             data.createdAt == request.time &&
+             (data.get('clientProfileUrl', null) == null || data.clientProfileUrl is string);
+    }
+
+    // --- RULES ---
+    
+    match /users/{userId} {
+      // allow reading users for email lookups when adding members. 
+      // It's probably better to secure this by checking email explicitly if we had an email index.
+      allow read: if isSignedIn(); 
+      
+      allow create: if isSignedIn() &&
+                    isValidId(userId) &&
+                    request.auth.uid == userId &&
+                    isValidUserProfile(incoming()) &&
+                    (incoming().globalRole == 'user' || request.auth.token.email == 'skagglegotu@gmail.com');
+
+      allow update: if isSignedIn() &&
+                    isValidId(userId) &&
+                    request.auth.uid == userId &&
+                    ((
+                      isValidUserProfileUpdate(incoming()) &&
+                      incoming().globalRole == existing().globalRole &&
+                      incoming().email == existing().email &&
+                      incoming().createdAt == existing().createdAt &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['displayName'])
+                    ) || isSuperAdmin());
+    }
+
+    match /accounts/{accountId} {
+      allow get: if isSignedIn() && isValidId(accountId) && (existing().ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+      allow list: if isSignedIn() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()); 
+
+      allow create: if isSignedIn() &&
+                    isValidId(accountId) &&
+                    isValidAccount(incoming());
+
+      allow update: if isSignedIn() &&
+                    isValidId(accountId) &&
+                    (existing().ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                    isValidAccount(incoming()) &&
+                    incoming().createdAt == existing().createdAt &&
+                    incoming().ownerId == existing().ownerId &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['name']);
+                    
+      allow delete: if isSignedIn() && isValidId(accountId) && (existing().ownerId == request.auth.uid || isSuperAdmin());
+      
+      match /members/{memberId} {
+        allow get: if isSignedIn() && isValidId(accountId) && isValidId(memberId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        allow list: if isSignedIn() && isValidId(accountId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+
+        allow create: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                      exists(/databases/$(database)/documents/users/$(memberId)) &&
+                      isValidAccountMember(incoming()) && 
+                      incoming().accountId == accountId &&
+                      incoming().userId == memberId;
+
+        allow update: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                      incoming().addedBy == existing().addedBy &&
+                      incoming().addedAt == existing().addedAt &&
+                      incoming().accountId == existing().accountId &&
+                      incoming().userId == existing().userId &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['role']);
+                      
+        allow delete: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin() || memberId == request.auth.uid);
+      }
+
+      match /posts/{postId} {
+        allow read: if isSignedIn() && isValidId(accountId) && isValidId(postId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        
+        allow create: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin()) &&
+                      isValidPostCreate(incoming()) &&
+                      (
+                        (isAccountContentCreator(accountId) && incoming().status == 'draft') ||
+                        (isAccountModerator(accountId) && incoming().status in ['draft', 'approved']) ||
+                        (isAccountAdmin(accountId) || get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isSuperAdmin())
+                      );
+
+        allow update: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin()) &&
+                      isValidPostUpdate(incoming()) &&
+                      (
+                        (isAccountContentCreator(accountId) && incoming().diff(existing()).affectedKeys().hasOnly(['pillar', 'topic', 'content', 'status', 'updatedAt', 'scheduledDate', 'hasGeneratedImage', 'mockImageUrl']) && incoming().status == 'draft' && existing().status == 'draft') ||
+                        (isAccountModerator(accountId) && incoming().diff(existing()).affectedKeys().hasOnly(['pillar', 'topic', 'content', 'status', 'updatedAt', 'scheduledDate', 'hasGeneratedImage', 'mockImageUrl']) && incoming().status in ['draft', 'approved']) ||
+                        ((isAccountAdmin(accountId) || get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isSuperAdmin()) && incoming().diff(existing()).affectedKeys().hasOnly(['pillar', 'topic', 'content', 'status', 'updatedAt', 'scheduledDate', 'hasGeneratedImage', 'mockImageUrl']))
+                      );
+                      
+        allow delete: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin() || existing().authorId == request.auth.uid);
+      }
+
+      match /ugcSubmissions/{submissionId} {
+        allow read: if isSignedIn() && isValidId(accountId) && isValidId(submissionId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        allow list: if isSignedIn() && isValidId(accountId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        
+        allow create: if isSignedIn() && isValidId(accountId) && isValidId(submissionId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin()) &&
+                      isValidUgcSubmission(incoming());
+
+        allow delete: if isSignedIn() && isValidId(accountId) && isValidId(submissionId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin() || existing().uploadedBy == request.auth.uid);
+      }
+    }
+
+    // Collection Group Queries for gathering accounts we are a member of
+    match /{path=**}/members/{memberId} {
+        allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+    
+    // For listing posts under an account if we are a member
+    match /accounts/{accountId}/posts/{postId} {
+      allow list: if isSignedIn() && isValidId(accountId) && 
+                  (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+    }
+  }
+}

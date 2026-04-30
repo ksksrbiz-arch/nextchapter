@@ -1,0 +1,194 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- PRIMITIVE DEFINITIONS ---
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    // Assume superadmin by email or by boolean flag on users profile, but simpler: checks actual user doc
+    function isSuperAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) 
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.globalRole == 'superadmin';
+    }
+
+    // Role checks
+    function isAccountAdmin(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isAccountModerator(accountId) {
+      return exists(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/accounts/$(accountId)/members/$(request.auth.uid)).data.role == 'moderator';
+    }
+    
+    function isAccountMember(accountId) {
+      return isAccountAdmin(accountId) || isAccountModerator(accountId);
+    }
+
+    // --- VALIDATION HELPER ---
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['email', 'globalRole', 'createdAt']) &&
+        data.email is string && data.email.size() <= 200 &&
+        data.globalRole in ['superadmin', 'user'] &&
+        (data.get('displayName', '') is string) &&
+        data.createdAt == request.time;
+    }
+    
+    function isValidUserProfileUpdate(data) {
+      // Allow display name update
+      return data.keys().hasAll(['email', 'globalRole', 'createdAt']) &&
+             data.email is string && data.email.size() <= 200 &&
+             data.globalRole in ['superadmin', 'user'] &&
+             (data.get('displayName', '') is string);
+    }
+
+    function isValidAccount(data) {
+      return data.keys().hasAll(['name', 'createdAt', 'ownerId']) &&
+             data.keys().size() == 3 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.ownerId == request.auth.uid &&
+             data.createdAt == request.time;
+    }
+
+    function isValidAccountMember(data) {
+      return data.keys().hasAll(['role', 'addedAt', 'addedBy']) &&
+             data.keys().size() == 3 &&
+             data.role in ['admin', 'moderator'] &&
+             data.addedBy == request.auth.uid &&
+             data.addedAt == request.time;
+    }
+
+    function isValidPostCreate(data) {
+      return data.keys().hasAll(['pillar', 'topic', 'content', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+             data.keys().size() == 7 &&
+             data.pillar is string && data.pillar.size() <= 200 &&
+             data.topic is string && data.topic.size() <= 500 &&
+             data.content is string && data.content.size() <= 10000 &&
+             data.status in ['draft', 'approved', 'published'] &&
+             data.authorId == request.auth.uid &&
+             data.createdAt == request.time &&
+             data.updatedAt == request.time;
+    }
+
+    function isValidPostUpdate(data) {
+      return data.keys().hasAll(['pillar', 'topic', 'content', 'status', 'authorId', 'createdAt', 'updatedAt']) &&
+             data.keys().size() == 7 &&
+             data.pillar is string && data.pillar.size() <= 200 &&
+             data.topic is string && data.topic.size() <= 500 &&
+             data.content is string && data.content.size() <= 10000 &&
+             data.status in ['draft', 'approved', 'published'] &&
+             data.authorId == existing().authorId &&
+             data.createdAt == existing().createdAt &&
+             data.updatedAt == request.time;
+    }
+
+    // --- RULES ---
+    
+    match /users/{userId} {
+      allow read: if isSignedIn(); // Any verified user can read profiles for invite purposes
+      
+      allow create: if isSignedIn() &&
+                    isValidId(userId) &&
+                    request.auth.uid == userId &&
+                    isValidUserProfile(incoming()) &&
+                    // ONLY the first user to sign in can self-assign superadmin, or by email?
+                    // Let's protect globalRole: users can only set 'user' unless they are already superadmin.
+                    (incoming().globalRole == 'user' || request.auth.token.email == 'skagglegotu@gmail.com');
+
+      allow update: if isSignedIn() &&
+                    isValidId(userId) &&
+                    request.auth.uid == userId &&
+                    isValidUserProfileUpdate(incoming()) &&
+                    incoming().globalRole == existing().globalRole && // Prevent self-elevation
+                    incoming().email == existing().email &&
+                    incoming().createdAt == existing().createdAt &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['displayName']);
+    }
+
+    match /accounts/{accountId} {
+      // Read: if owner, admin, or moderator
+      allow get: if isSignedIn() && isValidId(accountId) && (existing().ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+      allow list: if isSignedIn() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()); // List own accounts. Or rely on members list.
+
+      allow create: if isSignedIn() &&
+                    isValidId(accountId) &&
+                    isValidAccount(incoming());
+
+      allow update: if isSignedIn() &&
+                    isValidId(accountId) &&
+                    (existing().ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                    isValidAccount(incoming()) &&
+                    incoming().createdAt == existing().createdAt &&
+                    incoming().ownerId == existing().ownerId &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['name']);
+                    
+      allow delete: if isSignedIn() && isValidId(accountId) && (existing().ownerId == request.auth.uid || isSuperAdmin());
+      
+      // Subcollection: members
+      match /members/{memberId} {
+        allow read: if isSignedIn() && isValidId(accountId) && isValidId(memberId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        
+        allow create: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                      // Ensure the member exists in users
+                      exists(/databases/$(database)/documents/users/$(memberId)) &&
+                      isValidAccountMember(incoming());
+
+        allow update: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin()) &&
+                      incoming().addedBy == existing().addedBy &&
+                      incoming().addedAt == existing().addedAt &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['role']);
+                      
+        allow delete: if isSignedIn() && isValidId(accountId) && isValidId(memberId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin());
+      }
+
+      // Subcollection: posts
+      match /posts/{postId} {
+        allow read: if isSignedIn() && isValidId(accountId) && isValidId(postId) && 
+                    (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin());
+        
+        allow create: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin()) &&
+                      isValidPostCreate(incoming()) &&
+                      // Only let members create drafts or submit for approval. Admins can publish right away.
+                      (incoming().status in ['draft', 'approved'] || isAccountAdmin(accountId) || isSuperAdmin());
+
+        allow update: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountMember(accountId) || isSuperAdmin()) &&
+                      isValidPostUpdate(incoming()) &&
+                      (
+                        // Moderators can update content and status up to 'approved'
+                        (isAccountModerator(accountId) && incoming().diff(existing()).affectedKeys().hasOnly(['pillar', 'topic', 'content', 'status', 'updatedAt']) && incoming().status in ['draft', 'approved']) ||
+                        // Admins can update everything and set to 'published'
+                        ((isAccountAdmin(accountId) || get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isSuperAdmin()) && incoming().diff(existing()).affectedKeys().hasOnly(['pillar', 'topic', 'content', 'status', 'updatedAt']))
+                      );
+                      
+        allow delete: if isSignedIn() && isValidId(accountId) && isValidId(postId) &&
+                      (get(/databases/$(database)/documents/accounts/$(accountId)).data.ownerId == request.auth.uid || isAccountAdmin(accountId) || isSuperAdmin());
+      }
+    }
+  }
+}
